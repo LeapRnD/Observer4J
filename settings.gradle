@@ -1,0 +1,7 @@
+include ":observer4j:annotations"
+include ":observer4j:processor"
+include ":observer4j:runtime"
+
+project(":observer4j:annotations").projectDir = "$rootDir/annotations" as File
+project(":observer4j:processor").projectDir = "$rootDir/processor" as File
+project(":observer4j:runtime").projectDir = "$rootDir/runtime" as File
