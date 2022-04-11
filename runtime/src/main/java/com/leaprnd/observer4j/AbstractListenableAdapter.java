@@ -21,7 +21,13 @@ public abstract class AbstractListenableAdapter<T> extends AbstractListenable<T>
 	}
 
 	protected final void initialize() {
-		executor.execute(() -> initialize(build(listener)));
+		executor.execute(() -> {
+			try {
+				initialize(build(listener));
+			} catch (Throwable exception) {
+				initialize(exception);
+			}
+		});
 	}
 
 	protected abstract T build(Listener<Object> listener);
