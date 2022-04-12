@@ -1,7 +1,6 @@
 package com.leaprnd.observer4j;
 
 import org.jetbrains.annotations.NotNull;
-import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 
 import java.lang.invoke.MethodHandles;
@@ -9,7 +8,8 @@ import java.lang.invoke.VarHandle;
 import java.lang.ref.Cleaner;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReference;
@@ -105,36 +105,86 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 
 	}
 
-	private record State<T> (CountDownLatch latch, T value, ImmutableMap<T> forwarders, Emission emission) {
+	private sealed interface State<T> {
+		ValueState<T> waitUntilInitialized();
+		boolean complete(InitializedState<T> initializedState);
+	}
 
-		private State(T value) {
-			this(null, value, value == null ? null : emptyImmutableMap(), null);
+	private abstract sealed class UninitializedState implements State<T> {
+		@Override
+		public boolean complete(InitializedState<T> initializedState) {
+			return compareAndSetState(this, initializedState);
 		}
+	}
 
-		private State(CountDownLatch latch) {
-			this(requireNonNull(latch), null, null, null);
+	private final class InitialState extends UninitializedState {
+		@Override
+		public ValueState<T> waitUntilInitialized() {
+			return compareAndExchangeState(this, new InitializingState()).waitUntilInitialized();
 		}
+	}
 
-		private State(T value, ImmutableMap<T> forwarders, Emission emission) {
-			this(null, requireNonNull(value), requireNonNull(forwarders), emission);
-		}
+	private final class InitializingState extends UninitializedState {
 
-		private State {
-			if (value != null) {
-				if (forwarders == null) {
-					throw new IllegalArgumentException();
-				}
-				if (latch != null) {
-					throw new IllegalArgumentException();
-				}
+		private final CompletableFuture<InitializedState<T>> future = new CompletableFuture<>();
+
+		@Override
+		public ValueState<T> waitUntilInitialized() {
+			try {
+				return future.get().waitUntilInitialized();
+			} catch (InterruptedException | ExecutionException exception) {
+				throw unchecked(exception);
 			}
 		}
 
-		public State<T> with(ImmutableMap<T> newForwarders) {
+		@Override
+		public boolean complete(InitializedState<T> newState) {
+			return super.complete(newState) && future.complete(newState);
+		}
+
+	}
+
+	private sealed interface InitializedState<T> extends State<T> {
+		@Override
+		default boolean complete(InitializedState<T> initializedState) {
+			throw new IllegalStateException("Already initialized!");
+		}
+	}
+
+	private record ExceptionState<T> (Throwable exception) implements InitializedState<T> {
+
+		public ExceptionState {
+			requireNonNull(exception);
+		}
+
+		@Override
+		public ValueState<T> waitUntilInitialized() {
+			throw unchecked(exception);
+		}
+
+	}
+
+	private record ValueState<T> (T value, ImmutableMap<T> forwarders, Emission emission) implements InitializedState<T> {
+
+		public ValueState(T value) {
+			this(value, emptyImmutableMap(), null);
+		}
+
+		public ValueState {
+			requireNonNull(value);
+			requireNonNull(forwarders);
+		}
+
+		@Override
+		public ValueState<T> waitUntilInitialized() {
+			return this;
+		}
+
+		public ValueState<T> with(ImmutableMap<T> newForwarders) {
 			if (newForwarders == forwarders) {
 				return this;
 			}
-			return new State<>(null, value, newForwarders.clean(), emission);
+			return new ValueState<>(value, newForwarders.clean(), emission);
 		}
 
 	}
@@ -146,35 +196,35 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 	@NotNull
 	private volatile State<T> state;
 
-	protected AbstractListenable(@Nullable T initialValue) {
-		this(DIRECT_EXECUTOR, initialValue);
-	}
-
 	protected AbstractListenable() {
-		this(DIRECT_EXECUTOR, null);
+		this(DIRECT_EXECUTOR);
 	}
 
 	protected AbstractListenable(Executor executor) {
-		this(executor, null);
+		this.executor = executor;
+		this.state = new InitialState();
 	}
 
-	protected AbstractListenable(Executor executor, @Nullable T initialValue) {
+	protected AbstractListenable(T initialValue) {
+		this(DIRECT_EXECUTOR, initialValue);
+	}
+
+	protected AbstractListenable(Executor executor, T initialValue) {
 		this.executor = executor;
-		this.state = new State<>(initialValue);
+		this.state = new ValueState<>(initialValue);
 	}
 
 	public final void initialize(T initialValue) {
-		final var newState = new State<>(requireNonNull(initialValue));
+		initialize(new ValueState<>(initialValue));
+	}
+
+	public final void initialize(Throwable exception) {
+		initialize(new ExceptionState<>(exception));
+	}
+
+	private void initialize(InitializedState<T> initializedState) {
 		while (true) {
-			final var oldState = this.state;
-			if (oldState.value != null) {
-				throw new IllegalStateException("This listenable was already initialized!");
-			}
-			if (STATE_UPDATER.compareAndSet(this, oldState, newState)) {
-				final var latch = oldState.latch;
-				if (latch != null) {
-					latch.countDown();
-				}
+			if (state.complete(initializedState)) {
 				return;
 			}
 		}
@@ -184,7 +234,7 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 
 	@Override
 	public final T takeSnapshot() {
-		return detach(waitUntilInitializedToGetState().value);
+		return detach(state.waitUntilInitialized().value);
 	}
 
 	protected T detach(T value) {
@@ -215,7 +265,7 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 
 	private T listenWith(SynchronousListener<? super T> listener, ReferenceStrength strategy) {
 		while (true) {
-			final var oldState = waitUntilInitializedToGetState();
+			final var oldState = state.waitUntilInitialized();
 			final var oldForwarders = oldState.forwarders;
 			final var oldValue = oldState.value;
 			final var newForwarder = forward(oldValue);
@@ -224,7 +274,7 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 				return oldForwarders.get(listener);
 			}
 			final var newState = oldState.with(newForwarders);
-			if (tryToChangeState(oldState, newState)) {
+			if (compareAndSetState(oldState, newState)) {
 				CLEANER.register(listener, this);
 				return newForwarder;
 			}
@@ -242,7 +292,7 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 
 	@Override
 	public final Optional<T> relistenWith(SynchronousListener<? super T> listener) {
-		final var forwarder = waitUntilInitializedToGetState().forwarders.get(listener);
+		final var forwarder = state.waitUntilInitialized().forwarders.get(listener);
 		return ofNullable(forwarder);
 	}
 
@@ -254,14 +304,14 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 	@Override
 	public final boolean unlistenWith(SynchronousListener<? super T> listener) {
 		while (true) {
-			final var oldState = waitUntilInitializedToGetState();
+			final var oldState = state.waitUntilInitialized();
 			final var oldForwarders = oldState.forwarders;
 			final var newForwarders = oldForwarders.without(listener);
 			if (oldForwarders == newForwarders) {
 				return false;
 			}
 			final var newState = oldState.with(newForwarders);
-			if (tryToChangeState(oldState, newState)) {
+			if (compareAndSetState(oldState, newState)) {
 				return true;
 			}
 		}
@@ -273,11 +323,11 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 
 	protected final T update(UnaryOperator<T> action, ReturnValue returnValue) {
 		while (true) {
-			final var oldState = waitUntilInitializedToGetState();
+			final var oldState = state.waitUntilInitialized();
 			final var oldValue = oldState.value;
 			final var newValue = action.apply(oldValue);
 			final var newState = update(oldState, newValue);
-			if (tryToChangeState(oldState, newState)) {
+			if (compareAndSetState(oldState, newState)) {
 				return detach(switch (returnValue) {
 					case RETURN_OLD_VALUE -> oldValue;
 					case RETURN_NEW_VALUE -> newValue;
@@ -292,10 +342,10 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 
 	protected final T update(T newValue, ReturnValue returnValue) {
 		while (true) {
-			final var oldState = waitUntilInitializedToGetState();
+			final var oldState = state.waitUntilInitialized();
 			final var oldValue = oldState.value;
 			final var newState = update(oldState, newValue);
-			if (tryToChangeState(oldState, newState)) {
+			if (compareAndSetState(oldState, newState)) {
 				return detach(switch (returnValue) {
 					case RETURN_OLD_VALUE -> oldValue;
 					case RETURN_NEW_VALUE -> newValue;
@@ -304,7 +354,7 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 		}
 	}
 
-	private State<T> update(State<T> oldState, T newValue) {
+	private State<T> update(ValueState<T> oldState, T newValue) {
 		final var oldValue = oldState.value;
 		if (tryToSkipUpdate(oldValue, newValue)) {
 			return oldState;
@@ -312,7 +362,7 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 		final var oldForwarders = oldState.forwarders;
 		final var emitUpdateGlobally = new EmitUpdateGlobally(oldState.emission, oldValue, newValue);
 		if (tryToReplace(oldValue, newValue)) {
-			return new State<>(newValue, oldForwarders, emitUpdateGlobally);
+			return new ValueState<>(newValue, oldForwarders, emitUpdateGlobally);
 		}
 		final var newEmissions = new AtomicReference<Emission>(emitUpdateGlobally);
 		final var newForwarders = oldForwarders.map(entry -> {
@@ -325,7 +375,7 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 				return newForwarder;
 			}
 		});
-		return new State<>(newValue, newForwarders, newEmissions.get());
+		return new ValueState<>(newValue, newForwarders, newEmissions.get());
 	}
 
 	protected boolean tryToReplace(T oldValue, T newValue) {
@@ -340,12 +390,17 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 		return newValue.equals(oldValue);
 	}
 
-	private boolean tryToChangeState(State<T> oldState, State<T> newState) {
-		if (STATE_UPDATER.compareAndSet(this, oldState, newState)) {
+	private boolean compareAndSetState(State<T> expectedState, State<T> newState) {
+		return compareAndExchangeState(expectedState, newState) == expectedState;
+	}
+
+	@SuppressWarnings("unchecked")
+	private State<T> compareAndExchangeState(State<T> expectedState, State<T> newState) {
+		final var oldState = (State<T>) STATE_UPDATER.compareAndExchange(this, expectedState, newState);
+		if (oldState == expectedState) {
 			executor.execute(this);
-			return true;
 		}
-		return false;
+		return oldState;
 	}
 
 	@SuppressWarnings("rawtypes")
@@ -363,7 +418,7 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 		if (EMITTING.compareAndSet(this, 0, 1)) {
 			try {
 				while (true) {
-					final var oldState = waitUntilInitializedToGetState();
+					final var oldState = state.waitUntilInitialized();
 					final var oldForwarders = oldState.forwarders;
 					final var newForwarders = oldForwarders.clean();
 					if (newForwarders == oldForwarders && oldState.emission == null) {
@@ -374,7 +429,7 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 						}
 						return;
 					}
-					final var newState = new State<>(oldState.value, newForwarders, null);
+					final var newState = new ValueState<>(oldState.value, newForwarders, null);
 					if (STATE_UPDATER.compareAndSet(this, oldState, newState)) {
 						var emission = oldState.emission;
 						if (emission == null) {
@@ -401,33 +456,6 @@ public abstract class AbstractListenable<T> implements Listenable<T>, Runnable {
 			} finally {
 				EMITTING.set(this, 0);
 			}
-		}
-	}
-
-	private State<T> waitUntilInitializedToGetState() {
-		try {
-			while (true) {
-				final var oldState = this.state;
-				final var oldLatch = oldState.latch;
-				if (oldLatch != null) {
-					oldLatch.await();
-					continue;
-				}
-				final var oldValue = oldState.value;
-				if (oldValue == null) {
-					final var newLatch = new CountDownLatch(1);
-					final var newState = new State<>(newLatch);
-					if (STATE_UPDATER.compareAndSet(this, oldState, newState)) {
-						newLatch.await();
-						continue;
-					} else {
-						continue;
-					}
-				}
-				return oldState;
-			}
-		} catch (InterruptedException exception) {
-			throw unchecked(exception);
 		}
 	}
 
